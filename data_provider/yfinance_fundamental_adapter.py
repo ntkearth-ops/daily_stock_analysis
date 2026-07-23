@@ -1,40 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Yfinance fundamental adapter for HK/US markets (fail-open).
-
-Mirrors the bundle shape of `AkshareFundamentalAdapter.get_fundamental_bundle`
-so it can be plugged into `data_provider.base.get_fundamental_context()`
-without changing downstream consumers. Adds HK/US-specific fields:
-
-- ``earnings.financial_report.currency`` — financial statement currency
-  (``USD`` / ``HKD`` / ``CNY``) from ``info.financialCurrency``. For HK ADRs
-  yfinance commonly reports ``financialCurrency=CNY`` while trades settle in
-  HKD, so this differs from the dividend currency below.
-- ``earnings.dividend.currency`` — trading / dividend currency from
-  ``info.currency`` (e.g. HKD for 0700.HK). Used to suffix 港元/美元/元 for
-  per-share cash dividends and to scope the TTM yield denominator.
-- ``earnings.dividend.ttm_dividend_yield_pct`` — computed as
-  ``ttm_cash_dividend_per_share / latest_price * 100``, both sides in the
-  trading currency (info.currentPrice/regularMarketPrice/previousClose).
-  ``info.dividendYield`` is only used as a last-resort fallback and is
-  passed through as-is (current yfinance reports it in percent units).
-- ``belong_boards`` — derived from ``info.sector`` + ``info.industry``; the CN
-  pipeline derives it from AkShare 板块名单, this is the HK/US analogue.
-
-This adapter intentionally treats every yfinance call as best-effort and never
-raises to caller. Partial data is allowed; downstream `_infer_block_status` will
-mark the block as ``partial`` when only some fields are populated.
+Yfinance fundamental adapter for HK/US/ETF and Thai markets (fail-open).
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-
 
 _INCOME_REVENUE_KEYS = ("Total Revenue", "TotalRevenue", "Revenue")
 _INCOME_NET_PROFIT_KEYS = (
@@ -63,7 +39,6 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _ratio_to_pct(value: Any) -> Optional[float]:
-    """yfinance returns ratios as decimal (0.166 = 16.6%); convert to percent."""
     raw = _safe_float(value)
     if raw is None:
         return None
@@ -92,13 +67,6 @@ def _latest_value(row: Optional[pd.Series]) -> Optional[float]:
 
 
 def _yoy_from_row(row: Optional[pd.Series]) -> Optional[float]:
-    """Statement-derived YoY: requires the same quarter from 4 quarters back.
-
-    yfinance ``quarterly_*_stmt`` returns 4 quarters by default, so this
-    typically returns None and callers fall back to ``info.revenueGrowth`` /
-    ``info.earningsGrowth`` (already TTM YoY ratios). Doing QoQ via ``iloc[1]``
-    is wrong for seasonal businesses — explicitly refuse it.
-    """
     if row is None or row.empty or len(row) < 5:
         return None
     latest = _safe_float(row.iloc[0])
@@ -108,40 +76,38 @@ def _yoy_from_row(row: Optional[pd.Series]) -> Optional[float]:
     return round((latest - prev_year) / abs(prev_year) * 100.0, 4)
 
 
-def _epoch_to_date(value: Any) -> Optional[str]:
-    raw = _safe_float(value)
-    if raw is None:
-        return None
-    try:
-        return datetime.fromtimestamp(raw, tz=timezone.utc).date().isoformat()
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
 def _convert_to_yf_symbol(stock_code: str) -> str:
-    """Convert internal code to yfinance ticker. Lightweight inline reproduction
-    of YFinanceFetcher._convert_stock_code to avoid pulling the full fetcher
-    into the fundamental path.
-    """
+    """Convert internal code to yfinance ticker with support for US, HK, ETFs, CN A-shares, and Thai stocks."""
     code = (stock_code or "").strip().upper()
     if not code:
         return code
+        
+    # If the ticker already has a dot, return it as-is
+    if "." in code:
+        return code
+        
+    # Hong Kong Stocks
     if code.startswith("HK"):
         digits = code[2:].lstrip("0") or "0"
         return f"{digits.zfill(4)}.HK"
-    if "." in code:
-        return code
-    # Assume US ticker by default for non-HK / non-CN callers
+        
+    # Chinese A-Shares
+    if code.startswith("SH"):
+        return f"{code[2:]}.SS"
+    if code.startswith("SZ"):
+        return f"{code[2:]}.SZ"
+    if code.isdigit() and len(code) == 6:
+        return f"{code}.SS" if code.startswith("6") else f"{code}.SZ"
+        
+    # Thai Stocks (Stock Exchange of Thailand)
+    if code.startswith("SET:") or code.startswith("BK:"):
+        return f"{code.split(':')[1]}.BK"
+        
     return code
 
 
 class YfinanceFundamentalAdapter:
-    """HK/US fundamental adapter backed by yfinance.
-
-    Returns the same bundle keys as :class:`AkshareFundamentalAdapter` so the
-    aggregation in :func:`data_provider.base.get_fundamental_context` can stay
-    market-agnostic.
-    """
+    """HK/US/ETF/Thai fundamental adapter backed by yfinance."""
 
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -176,12 +142,9 @@ class YfinanceFundamentalAdapter:
             result["errors"].append(f"info:{type(exc).__name__}:{exc}")
             info = {}
 
-        # Financial statements (income/cashflow) are reported in `financialCurrency`;
-        # for HK ADRs that is often CNY even when the stock trades in HKD. Dividends
-        # and live price are paid/quoted in `currency` — keep them separate so the
-        # renderer can suffix per-block currency tags correctly.
         financial_currency = str(info.get("financialCurrency") or info.get("currency") or "").upper() or None
         dividend_currency = str(info.get("currency") or info.get("financialCurrency") or "").upper() or None
+        quote_type = str(info.get("quoteType") or "").upper()
 
         # ---------------- growth block ----------------
         growth_payload: Dict[str, Any] = {
@@ -230,8 +193,6 @@ class YfinanceFundamentalAdapter:
         if cashflow_df is not None and not cashflow_df.empty:
             operating_cash_flow_latest = _latest_value(_pick_row(cashflow_df, _CASHFLOW_OP_KEYS))
 
-        # Fallback to TTM aggregates from .info when quarterly statements are
-        # unavailable — still produces a non-empty row.
         if revenue_latest is None:
             revenue_latest = _safe_float(info.get("totalRevenue"))
         if operating_cash_flow_latest is None:
@@ -241,10 +202,6 @@ class YfinanceFundamentalAdapter:
             if margin is not None:
                 net_profit_latest = revenue_latest * margin
 
-        # Statement-derived YoY (requires 4 quarters of history) is preferred
-        # over .info ratios; otherwise keep the TTM growth values already set
-        # from info.revenueGrowth / info.earningsGrowth above. Refuse QoQ
-        # fallback — it produces misleading numbers for seasonal businesses.
         statement_revenue_yoy = _yoy_from_row(revenue_row)
         statement_net_profit_yoy = _yoy_from_row(net_profit_row)
         if statement_revenue_yoy is not None:
@@ -274,14 +231,9 @@ class YfinanceFundamentalAdapter:
             result["errors"].append(f"dividends:{type(exc).__name__}")
             div_series = None
         if div_series is not None and not div_series.empty:
-            # yfinance 1.2.x returns Ticker.dividends as a single-column DataFrame, not a
-            # Series; coerce so `.items()` yields (timestamp, value) rather than
-            # (column_name, Series). Otherwise every event is dropped (`_safe_float(Series)`
-            # -> None) and TTM silently falls back to the annual-rate estimate.
             if hasattr(div_series, "columns"):
                 div_series = div_series.iloc[:, 0]
             try:
-                # Index is timezone-aware (ex-dividend date)
                 cutoff = pd.Timestamp.now(tz=div_series.index.tz) - pd.Timedelta(days=365)
                 for ts, value in div_series.items():
                     per_share = _safe_float(value)
@@ -328,11 +280,6 @@ class YfinanceFundamentalAdapter:
                 "as_of": datetime.now(timezone.utc).date().isoformat(),
             }
 
-            # Yield: prefer recomputing from TTM cash / latest price so the
-            # numerator and denominator are consistent (and both in the trading
-            # currency). yfinance's `info.dividendYield` is now reported in
-            # percent units, but past versions returned a ratio and some ADR
-            # payloads still drift — keep it as a last-resort passthrough only.
             latest_price = (
                 _safe_float(info.get("currentPrice"))
                 or _safe_float(info.get("regularMarketPrice"))
@@ -346,21 +293,30 @@ class YfinanceFundamentalAdapter:
             else:
                 raw_yield = _safe_float(info.get("dividendYield"))
                 if raw_yield is not None:
-                    # Pass through as-is; current yfinance already returns percent.
                     yield_pct = round(raw_yield, 4)
             if yield_pct is not None:
                 dividend_payload["ttm_dividend_yield_pct"] = yield_pct
             result.setdefault("earnings", {})["dividend"] = dividend_payload
             result["source_chain"].append("earnings.dividend:yfinance")
 
-        # ---------------- belong_boards (sector + industry) ----------------
+        # ---------------- belong_boards (sector + industry + ETF category) ----------------
         belong_boards: List[Dict[str, Any]] = []
         sector_name = str(info.get("sector") or info.get("sectorDisp") or "").strip()
         if sector_name:
             belong_boards.append({"name": sector_name, "type": "行业"})
+        
         industry_name = str(info.get("industry") or info.get("industryDisp") or "").strip()
         if industry_name and industry_name != sector_name:
             belong_boards.append({"name": industry_name, "type": "概念"})
+
+        # ETF Fallback: Capture ETF category or type if standard sectors are empty
+        category_name = str(info.get("category") or info.get("fundFamily") or "").strip()
+        if quote_type in ("ETF", "MUTUALFUND") or not belong_boards:
+            if category_name:
+                belong_boards.append({"name": category_name, "type": "ETF Fund Category"})
+            elif quote_type in ("ETF", "MUTUALFUND"):
+                belong_boards.append({"name": quote_type, "type": "Asset Type"})
+
         if belong_boards:
             result["belong_boards"] = belong_boards
             result["source_chain"].append("belong_boards:yfinance.info")
@@ -369,6 +325,9 @@ class YfinanceFundamentalAdapter:
             result.get("growth")
             or result.get("earnings")
             or result.get("belong_boards")
+            or quote_type in ("ETF", "MUTUALFUND")
+            or info.get("symbol")
         )
         result["status"] = "partial" if has_content else "not_supported"
         return result
+    
